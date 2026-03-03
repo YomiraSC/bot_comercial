@@ -386,3 +386,188 @@ comercial.config_modelo         ← Pesos y umbrales configurables
                                    (asesor cierra venta)
                                    estado="venta"
 ```
+
+---
+
+## Estructura completa de archivos
+
+El proyecto tiene la misma estructura que el bot de reactivaciones, con cada responsabilidad separada en su propio archivo:
+
+```
+bot_comercial/
+  app_comercial.py                  ← App Flask principal (webhook + agente + tools)
+  component_postgresql_comercial.py ← Manager PostgreSQL (esquema comercial)
+  component_firestore.py            ← Manager Firestore (coleccion "comercial")
+  component_openai.py               ← Manager OpenAI (analisis NLP de leads)
+  help_prompt.py                    ← Todos los prompts del sistema
+  help_helpers.py                   ← Utilidades de scoring y formateo
+  api_keys.py                       ← Clave de OpenAI
+  comercial_schema_final.sql        ← DDL de la BD (referencia)
+  EXPLICACION_BOT_COMERCIAL.md      ← Este archivo
+```
+
+### Comparacion con el bot de reactivaciones
+
+| Reactivaciones | Comercial | Funcion |
+|---|---|---|
+| `app.py` | `app_comercial.py` | App Flask + webhook + agente |
+| `component_postgresql.py` | `component_postgresql_comercial.py` | Operaciones PostgreSQL |
+| `component_firestore.py` | `component_firestore.py` | Logs de mensajes en Firestore |
+| `component_openai.py` | `component_openai.py` | Llamadas a GPT-4 |
+| `help_prompt.py` | `help_prompt.py` | Prompts del sistema |
+| `help_helpers.py` | `help_helpers.py` | Funciones utilitarias |
+| `api_keys.py` | `api_keys.py` | Claves de API |
+
+---
+
+## Archivo 3: `component_firestore.py`
+
+Manager de Firestore adaptado para el bot comercial. Usa la coleccion `"comercial"` (en vez de `"reactivaciones"`).
+
+### Clase: `DataBaseFirestoreManager`
+
+| Metodo | Que hace |
+|--------|----------|
+| `_connect()` | Establece conexion con Firestore |
+| `_reconnect_if_needed()` | Verifica conexion y reconecta si se perdio |
+| `crear_documento(celular, id_lead, id_bot, mensaje, sender)` | Crea documento en coleccion `comercial`. `sender=True` si es del lead, `False` si es del bot |
+| `recuperar_mensajes_hoy(id_bot, celular)` | Recupera mensajes del dia para un lead (zona Lima) |
+| `recuperar_mensajes_hoy_alt(id_bot, celular)` | Version alternativa usando UTC |
+
+Diferencias con el de reactivaciones:
+- Coleccion: `"comercial"` en vez de `"reactivaciones"`
+- Campo: `id_lead` en vez de `id_cliente`
+- El nombre de coleccion se define en `self.collection_name` (facil de cambiar)
+
+---
+
+## Archivo 4: `component_openai.py`
+
+Manager de OpenAI con metodos especializados para analisis NLP de leads comerciales.
+
+### Clase: `OpenAIComercialManager`
+
+| Metodo | Que hace | Retorna |
+|--------|----------|---------|
+| `analizar_mensaje_nlp(mensaje)` | Clasifica sentimiento, interes e intencion del mensaje | `{"sentimiento": "...", "nivel_interes": "...", "intencion_compra": "...", "keywords": [...], "reply": "...", "derivar": bool}` |
+| `extraer_datos_personales(mensaje)` | Extrae DNI, nombre, apellido y correo del texto | `{"dni": "..." o null, "tipo_documento": "...", "nombre": "...", "apellido": "...", "correo": "..."}` |
+| `obtener_dni_brindado(mensaje)` | Extrae DNI/RUC/CE de la conversacion | `{"tipo": "DNI", "numero": "12345678"}` o `None` |
+| `generar_respuesta_inicio_conversacion()` | Mensaje de bienvenida del bot | String de bienvenida |
+
+Cada metodo tiene fallback: si GPT-4 falla o retorna JSON invalido, devuelve valores por defecto (neutral/bajo/baja) en vez de romper.
+
+Diferencias con el de reactivaciones:
+- Reactivaciones tiene metodos para: clasificar intenciones de pago, generar codigos, manejar contratos
+- Comercial tiene metodos para: analisis NLP con scoring, extraccion de datos personales, deteccion de intencion de compra
+- Comercial usa `gpt-4.1-2025-04-14` como modelo por defecto
+- Comercial incluye `limpiar_json_llm()` para quitar bloques ````json` de respuestas
+
+---
+
+## Archivo 5: `help_prompt.py`
+
+Contiene todos los prompts del sistema centralizados. Esto permite modificar el comportamiento del bot sin tocar la logica de `app_comercial.py`.
+
+| Funcion | Donde se usa | Que hace |
+|---------|-------------|----------|
+| `prompt_analisis_nlp_lead()` | `component_openai.py` → `analizar_mensaje_nlp()` | Prompt que clasifica sentimiento, interes e intencion y genera reply |
+| `prompt_extraccion_datos_personales()` | `component_openai.py` → `extraer_datos_personales()` | Prompt que extrae DNI/nombre/apellido/correo del texto |
+| `prompt_sistema_agente()` | `app_comercial.py` → seccion 5 | Prompt de sistema del agente LangGraph (define personalidad, reglas, cuando usar herramientas) |
+| `prompt_inicio_conversacion_comercial()` | `component_openai.py` → `generar_respuesta_inicio()` | Mensaje de bienvenida del bot |
+| `prompt_obtener_dni(conversation_text)` | `component_openai.py` → `obtener_dni_brindado()` | Extrae DNI/RUC/CE de conversacion completa |
+
+Diferencias con el de reactivaciones:
+- Reactivaciones tiene prompts para: clasificar intenciones de pago (5 tipos), generar codigos, pedir eleccion de contrato
+- Comercial tiene prompts para: analisis NLP multivariable (sentimiento + interes + intencion), extraccion de datos, nurturing de leads
+
+---
+
+## Archivo 6: `help_helpers.py`
+
+Funciones utilitarias y constantes de scoring. Separa la logica de calculo de `app_comercial.py` para mantenerlo limpio.
+
+### Constantes
+
+| Constante | Contenido |
+|-----------|-----------|
+| `SENTIMIENTO_MAP` | `{"positivo": 1.0, "neutral": 0.5, "negativo": 0.0}` |
+| `INTERES_MAP` | `{"alto": 1.0, "medio": 0.5, "bajo": 0.0}` |
+| `INTENCION_MAP` | `{"alta": 1.0, "media": 0.5, "baja": 0.0}` |
+| `PESOS_DEFAULT` | Pesos por defecto si `config_modelo` no esta disponible |
+
+### Funciones de Scoring
+
+| Funcion | Que hace |
+|---------|----------|
+| `score_tiempo_respuesta(segundos)` | Convierte segundos a score: <2min=1.0, 2-10min=0.7, 10-60min=0.3, >60min=0.0 |
+| `calcular_raw_score(sentimiento, interes, intencion, tiempo, config)` | Calcula score ponderado: `w_s*S + w_i*I + w_t*T + w_c*C` |
+| `calcular_score_ema(score_antes, raw_score, config)` | Aplica EMA: `score_ant*(1-alpha) + raw*alpha` |
+| `calcular_contactabilidad(contactos)` | `min(1.0, (contactos+1)/10)` |
+
+### Funciones de Decision
+
+| Funcion | Que hace |
+|---------|----------|
+| `debe_descartar_lead(intencion, sentimiento, score)` | `True` si intencion=baja + sentimiento=negativo + score<0.10 |
+| `debe_derivar_a_asesor(score, derivar_flag, config)` | `True` si score>=umbral o LLM indico derivar=true |
+
+### Funciones de Formato
+
+| Funcion | Que hace |
+|---------|----------|
+| `formatear_conversacion(mensajes)` | Formatea lista de Firestore en texto `Lead: ... / Asistente: ...` |
+| `limpiar_json_llm(texto)` | Quita bloques ````json``` de respuestas de GPT-4 |
+
+Diferencias con el de reactivaciones:
+- Reactivaciones tiene: `agregar_coma_al_dni()`, `quitar_coma_al_dni()`, `formatear_conversacion()` (3 funciones simples)
+- Comercial tiene: 10 funciones enfocadas en scoring, decisiones automaticas y formato
+
+---
+
+## Como se conectan todos los archivos
+
+```
+app_comercial.py  (orquestador principal)
+    |
+    +-- importa --> api_keys.py                       (clave OpenAI)
+    +-- importa --> component_postgresql_comercial.py  (operaciones BD)
+    +-- importa --> component_firestore.py             (logs Firestore)
+    +-- importa --> component_openai.py                (llamadas GPT-4)
+    |                   |
+    |                   +-- importa --> help_prompt.py  (prompts)
+    |                   +-- importa --> help_helpers.py (limpiar JSON)
+    |                   +-- importa --> api_keys.py     (clave OpenAI)
+    |
+    +-- importa --> help_prompt.py                     (prompt del agente)
+    +-- importa --> help_helpers.py                    (scoring, mapeos, decisiones)
+```
+
+Flujo de un mensaje entrante:
+
+```
+1. WhatsApp envia POST a /webhook_comercial
+2. app_comercial.py parsea el mensaje
+3. app_comercial.py llama a component_firestore.py para log
+4. app_comercial.py invoca el agente LangGraph
+5. El agente decide llamar a analizar_mensaje_lead (tool)
+6. El tool llama a component_openai.py → analizar_mensaje_nlp()
+   - component_openai.py usa help_prompt.py para el prompt
+   - component_openai.py usa help_helpers.py para limpiar JSON
+7. El tool usa help_helpers.py para calcular scoring
+8. El tool llama a component_postgresql_comercial.py para guardar
+9. El tool retorna el reply
+10. app_comercial.py registra outbound en PostgreSQL y Firestore
+11. app_comercial.py envia respuesta por WhatsApp
+```
+
+---
+
+## Archivo 7: `api_keys.py`
+
+Archivo simple con la clave de OpenAI. Debe reemplazarse con la clave real antes de ejecutar.
+
+```python
+openai_api_key = "TU_OPENAI_API_KEY"
+```
+
+Este archivo NO se sube a git (deberia estar en `.gitignore`).
