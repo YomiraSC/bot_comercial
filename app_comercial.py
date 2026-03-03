@@ -38,6 +38,7 @@ from help_helpers import (
     INTERES_MAP,
     INTENCION_MAP,
     score_tiempo_respuesta,
+    calcular_datos_capturados,
     calcular_raw_score,
     calcular_score_ema,
     calcular_contactabilidad,
@@ -205,6 +206,9 @@ def analizar_mensaje_lead(payload: str) -> str:
     print(f"[ANALIZAR] sent={sentimiento} int={nivel_interes} "
           f"comp={intencion_compra} derivar={derivar} t_resp={t_resp}", flush=True)
 
+    # Calcular datos capturados del lead
+    datos_cap = calcular_datos_capturados(lead)
+
     # Calcular scoring (usando help_helpers)
     config = postgresql_comercial.obtener_config_modelo()
 
@@ -213,6 +217,7 @@ def analizar_mensaje_lead(payload: str) -> str:
         nivel_interes=nivel_interes,
         intencion_compra=intencion_compra,
         tiempo_score=tiempo_score,
+        datos_capturados=datos_cap,
         config=config,
     )
 
@@ -251,7 +256,7 @@ def analizar_mensaje_lead(payload: str) -> str:
     )
 
     # Descarte automatico por rechazo explicito
-    if debe_descartar_lead(intencion_compra, sentimiento, score_nuevo):
+    if debe_descartar_lead(intencion_compra, sentimiento, score_nuevo, config):
         postgresql_comercial.actualizar_estado_lead(id_lead, "descartado")
         print(f"[ANALIZAR] lead descartado por rechazo explicito score={score_nuevo}", flush=True)
 
