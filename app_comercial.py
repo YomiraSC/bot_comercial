@@ -164,6 +164,13 @@ consultar_informacion_rag = Tool(
 # -------------------------------------------------------------------
 
 # 4.1 Analizar mensaje del lead (core)
+#
+# Esta herramienta realiza DOS funciones en una sola llamada GPT-4:
+#   A) ANALISIS NLP: sentimiento, interes, intencion, keywords, reply
+#   B) SCORING DINAMICO: calcula score post-conversacion con 5 variables
+#
+# Se mantienen juntas porque comparten el analisis NLP (evita doble llamada API).
+
 @tool(
     "analizar_mensaje_lead",
     description=(
@@ -174,12 +181,27 @@ consultar_informacion_rag = Tool(
 )
 def analizar_mensaje_lead(payload: str) -> str:
     """
-    payload: texto crudo del lead.
-    Efecto: Analiza NLP, calcula scoring, actualiza bd_leads + hist_scoring + hist_conversaciones.
-    Retorno: reply listo para WhatsApp.
+    Herramienta principal del bot comercial.
+
+    Flujo interno:
+      1. Preparacion: obtener lead, config, tiempo de respuesta
+      2. Analisis NLP: llamada a GPT-4 (sentimiento, interes, intencion, reply)
+      3. Scoring: calcular score con 5 variables + EMA
+      4. Persistencia: guardar scoring y mensaje en BD
+      5. Acciones: evaluar descarte o derivacion
+      6. Respuesta: retornar reply para WhatsApp
+
+    Args:
+        payload: texto crudo del mensaje del lead
+
+    Returns:
+        reply listo para enviar por WhatsApp
     """
     print(f"[ANALIZAR] payload={payload!r}", flush=True)
 
+    # ──────────────────────────────────────────────────────────────────
+    # 1. PREPARACION: Contexto del lead y configuracion
+    # ──────────────────────────────────────────────────────────────────
     sender = getattr(g, "sender", None)
     lead = postgresql_comercial.buscar_o_crear_lead(sender)
     if not lead:
@@ -188,29 +210,33 @@ def analizar_mensaje_lead(payload: str) -> str:
     id_lead = str(lead["id_lead"])
     score_antes = float(lead.get("scoring") or 0)
     contactos = int(lead.get("cantidad_contactos_lead_bot") or 0)
+    config = postgresql_comercial.obtener_config_modelo()
 
-    # Tiempo de respuesta
+    # Tiempo de respuesta (para variable de engagement)
     t_resp = postgresql_comercial.calcular_tiempo_respuesta(id_lead)
     tiempo_score = score_tiempo_respuesta(t_resp)
 
-    # NLP con OpenAI (usando component_openai)
+    # ──────────────────────────────────────────────────────────────────
+    # 2. ANALISIS NLP: Una sola llamada a GPT-4
+    # ──────────────────────────────────────────────────────────────────
     nlp = openai_mgr.analizar_mensaje_nlp(payload)
 
-    sentimiento      = nlp["sentimiento"]
-    nivel_interes    = nlp["nivel_interes"]
-    intencion_compra = nlp["intencion_compra"]
-    keywords         = nlp["keywords"]
-    reply            = nlp["reply"]
-    derivar          = nlp["derivar"]
+    sentimiento      = nlp["sentimiento"]       # positivo | neutral | negativo
+    nivel_interes    = nlp["nivel_interes"]     # alto | medio | bajo
+    intencion_compra = nlp["intencion_compra"]  # alta | media | baja
+    keywords         = nlp["keywords"]          # lista de keywords
+    reply            = nlp["reply"]             # respuesta generada
+    derivar          = nlp["derivar"]           # bool: derivar a asesor?
 
     print(f"[ANALIZAR] sent={sentimiento} int={nivel_interes} "
           f"comp={intencion_compra} derivar={derivar} t_resp={t_resp}", flush=True)
 
-    # Calcular datos capturados del lead
-    datos_cap = calcular_datos_capturados(lead)
-
-    # Calcular scoring (usando help_helpers)
-    config = postgresql_comercial.obtener_config_modelo()
+    # ──────────────────────────────────────────────────────────────────
+    # 3. SCORING DINAMICO: 5 variables ponderadas + EMA
+    #    Formula: raw = w_s*S + w_i*I + w_t*T + w_c*C + w_d*D
+    #    EMA: score_nuevo = score_antes*(1-alpha) + raw*alpha
+    # ──────────────────────────────────────────────────────────────────
+    datos_cap = calcular_datos_capturados(lead)  # % de DNI, nombre, correo
 
     raw_score_val = calcular_raw_score(
         sentimiento=sentimiento,
@@ -222,16 +248,16 @@ def analizar_mensaje_lead(payload: str) -> str:
     )
 
     score_nuevo = calcular_score_ema(score_antes, raw_score_val, config)
-
-    # Contactabilidad
     contactabilidad = calcular_contactabilidad(contactos)
 
-    # Obtener valores numericos para BD
+    # Valores numericos para BD
     sent_num = SENTIMIENTO_MAP.get(sentimiento, 0.5)
     int_num  = INTERES_MAP.get(nivel_interes, 0.0)
     comp_num = INTENCION_MAP.get(intencion_compra, 0.0)
 
-    # Guardar en BD
+    # ──────────────────────────────────────────────────────────────────
+    # 4. PERSISTENCIA: Guardar scoring y mensaje en BD
+    # ──────────────────────────────────────────────────────────────────
     postgresql_comercial.actualizar_scoring_lead(
         id_lead=id_lead,
         scoring_nuevo=score_nuevo,
@@ -242,7 +268,6 @@ def analizar_mensaje_lead(payload: str) -> str:
         evento_trigger="respuesta_bot",
     )
 
-    # Registrar mensaje inbound con metadata NLP
     postgresql_comercial.registrar_mensaje(
         id_lead=id_lead,
         direccion="inbound",
@@ -255,15 +280,19 @@ def analizar_mensaje_lead(payload: str) -> str:
         tiempo_respuesta_seg=t_resp,
     )
 
-    # Descarte automatico por rechazo explicito
+    # ──────────────────────────────────────────────────────────────────
+    # 5. ACCIONES: Evaluar descarte o derivacion automatica
+    # ──────────────────────────────────────────────────────────────────
     if debe_descartar_lead(intencion_compra, sentimiento, score_nuevo, config):
         postgresql_comercial.actualizar_estado_lead(id_lead, "descartado")
         print(f"[ANALIZAR] lead descartado por rechazo explicito score={score_nuevo}", flush=True)
 
-    # Indicar derivacion si score alto
     if debe_derivar_a_asesor(score_nuevo, derivar, config):
         print(f"[ANALIZAR] score={score_nuevo}, sugerir derivacion", flush=True)
 
+    # ──────────────────────────────────────────────────────────────────
+    # 6. RESPUESTA: Retornar reply para WhatsApp
+    # ──────────────────────────────────────────────────────────────────
     return reply or ("Gracias por escribirnos. Cuentame, en que producto o servicio "
                      "estas interesado? Estoy aqui para ayudarte.")
 
